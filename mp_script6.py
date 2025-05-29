@@ -5,10 +5,11 @@ Script to generate a new set of hashes for articles in the PMC OA subset.
 from datetime import datetime
 import hashlib
 import json
+import multiprocessing
 from typing import Any, Dict, List, Optional, Tuple
 import multiprocessing as mp
 from queue import Empty
-from multiprocessing import Queue, Process, Value
+from multiprocessing import Queue, Process, current_process
 from multiprocessing.synchronize import Lock, Semaphore
 from multiprocessing.connection import Connection
 import numpy as np
@@ -25,7 +26,7 @@ with open("ncbi_api_key.txt", 'r') as f:
 
 OA_FILES_URL = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_file_list.txt"
 OA_FILES_PATH = "oa_file_list.txt"
-OA_EXPECTED_SIZE = 723799944
+OA_EXPECTED_SIZE = 748799944
 N_PAPERS_BLOCK = int(300)
 OUTPATH = "hashes.tsv"
 BASE_QUERY = (
@@ -92,19 +93,34 @@ def get_sleep_time(
 
 	raise ValueError("Shouldn't happen, not enough locks for processes")
 
+def log(
+	proc: Process,
+	msg: str
+) -> None:
+	now = datetime.now()
+	print(f"[{now.strftime('%H:%M:%S')} - {proc.name}]: {msg}")
+
 def worker(
 	in_q: "Queue[Tuple[int, str, List[str]]]",
 	out_q: "Queue[Tuple[int, List[str]]]",
-	sleep_locks: Dict[int, Lock]
+	sleep_locks: Dict[int, Lock],
+	verbose: bool
 ) -> None:
 	"""
 	"""
+	proc = current_process()
+
 	while not in_q.empty():
 
 		try:
 			block_num, base_query, pmc_ids = in_q.get(timeout = 45)
 		except Empty:
-			time.sleep(1)
+			if verbose:
+				log(
+					proc, #type: ignore
+					"in_q is currently empty, sleeping for 5 seconds."
+				)
+			time.sleep(5)
 			continue
 
 		query_res = None
@@ -114,10 +130,19 @@ def worker(
 
 			query_url = base_query.format(pmcids = query)
 
+			if verbose:
+				log(
+					proc, #type: ignore
+					(
+						f"Submitting query for block {block_num} "
+						f"with {len(pmc_ids)} papers."
+					)
+				)
+
 			query_res = requests.get(
 				query_url,
 				timeout = 30
-			).json()
+			)
 
 		except Exception as e:
 			in_q.put((block_num, base_query, pmc_ids))
@@ -126,10 +151,16 @@ def worker(
 
 			n_running = n_running_procs(sleep_locks)
 
-			print((
-				f"Lost connection, sleeping for {sleep_time} seconds. "
-				f"There are {n_running} running processes."
-			))	
+			log(
+				proc, #type: ignore
+				(
+					f"Lost connection ({e}), sleeping for {sleep_time} seconds. "
+					f"First few records were {','.join(pmc_ids[:5])}. "
+					f"Put block {block_num} ({len(pmc_ids)} papers) back in "
+					f"the queue. "
+					f"There are {n_running} running processes."
+				)
+			)	
 
 			time.sleep(sleep_time)
 
@@ -137,62 +168,110 @@ def worker(
 
 			n_running = n_running_procs(sleep_locks)
 
-			print((
-				f"Restarting process. There are "
-				f"{n_running} running processes."
-			))
+			log(
+				proc, #type: ignore
+				(
+					f"Restarting process. There are "
+					f"{n_running} running processes."
+				)
+			)
 
 			continue
 
-		new_hashes: List[str] = []
+		try:
+			query_json = query_res.json()
 
-		seen = {}
+			new_hashes: List[str] = []
 
-		for paper in query_res:
-			passages = paper["documents"][0]["passages"]
-			pmc_id = paper["documents"][0]["id"]
+			seen = {}
 
-			if pmc_id == "unknown":
-				continue
+			for paper in query_json:
+				passages = paper["documents"][0]["passages"]
+				pmc_id = paper["documents"][0]["id"]
 
-			if pmc_id[:3] != "PMC":
+				if pmc_id == "unknown":
+					continue
+
+				if pmc_id[:3] != "PMC":
+					try:
+						int(pmc_id)
+					except ValueError:
+						raise ValueError(f"Got unrecognizable PMCID '{pmc_id}'")
+
+					pmc_id = f"PMC{pmc_id}"
+
+				## Skip duplicate results since they seem to have the same hash
+				## value when they do appear
 				try:
-					int(pmc_id)
-				except ValueError:
-					raise ValueError(f"Got unrecognizable PMCID '{pmc_id}'")
+					seen[pmc_id]
+					continue
+				except KeyError:
+					pass
 
-				pmc_id = f"PMC{pmc_id}"
+				passage_hashes: List[str] = []
 
-			## Skip duplicate results since they seem to have the same hash
-			## value when they do appear
-			try:
-				seen[pmc_id]
-				continue
-			except KeyError:
-				pass
+				for passage in passages:
+					md5 = hashlib.md5()
+					md5.update(passage["text"].encode())
+					passage_hashes.append(md5.hexdigest()[:PASSAGE_HASH_LEN])
 
-			passage_hashes: List[str] = []
+				new_hashes.append(
+					f"{pmc_id}\t{''.join(passage_hashes)}\n"
+				)
 
-			for passage in passages:
-				md5 = hashlib.md5()
-				md5.update(passage["text"].encode())
-				passage_hashes.append(md5.hexdigest()[:PASSAGE_HASH_LEN])
+				seen[pmc_id] = 1
 
-			new_hashes.append(
-				f"{pmc_id}\t{''.join(passage_hashes)}\n"
-			)
+			res	= (block_num, new_hashes)
 
-			seen[pmc_id] = 1
+			out_q.put(res)
 
-		res	= (block_num, new_hashes)
+			if verbose:
+				log(
+					proc, #type: ignore
+					f"Put result for block {block_num} in result queue."
+				)
 
-		out_q.put(res)
+		except json.JSONDecodeError:
+			if verbose:
+				log(
+					proc, #type: ignore
+					f"Got JSON decoding error for block {block_num}, "
+					f"assuming there are missing records."
+				)
 
-		time.sleep(1)
+			missing_hashes = []
+
+			for pmc_id in pmc_ids:
+				missing_hashes.append(
+					f"{pmc_id}\tblock_missing\n"
+				)
+
+			if verbose:
+				log(
+					proc, #type: ignore
+					f"Putting placeholders for missing block {block_num} "
+					f"in queue."
+				)
+			
+			out_q.put((block_num, missing_hashes))
+			
+
 
 if __name__ == "__main__":
+	if len(sys.argv) ==  0:
+		verbose = False
+	elif "-v" in sys.argv or "--verbose" in sys.argv[1]:
+		verbose = True
+	else:
+		verbose = False
+
+	main_proc = current_process()
+
 	## Retrieve a new copy of the OA files list
-	print("Downloading open access file list (total size is approximate)...")
+	log(
+		main_proc, #type: ignore
+		"Downloading open access file list (total size is approximate)..."
+	)
 
 	if True:
 		download_with_progress(
@@ -201,13 +280,17 @@ if __name__ == "__main__":
 		)
 
 	## Load file list
-	print("Loading PMC IDs...")
+	log(
+		main_proc, # type: ignore
+		"Loading PMC IDs..."
+	)
 
 	oa_files = pd.read_csv(
 		OA_FILES_PATH,
 		sep = '\t',
 		skiprows = 1,
-		#nrows = 10045 ## DEBUG ONLY
+		#skiprows = 6894600 ## DEBUG ONLY
+		#nrows = 50000 ## DEBUG ONLY
 	)
 
 	pmc_ids = oa_files.iloc[:,2].tolist()
@@ -223,17 +306,37 @@ if __name__ == "__main__":
 			)
 		)
 
+	if verbose:
+		log(
+			main_proc, #type: ignore
+			f"There are {len(pmc_id_blocks)} blocks."
+		)
+
 	## Query results
 
-	print(f"Querying hashes for {len(pmc_ids)} manuscripts...")
+	log(
+		main_proc, #type: ignore
+		f"Querying hashes for {len(pmc_ids)} manuscripts..."
+	)
 
 	proc_results: List[Tuple[int, List[str]]] = []
 
 	in_q: "Queue[Tuple[int, str, List[str]]]" = mp.Queue()
 	out_q: "Queue[Tuple[int, List[str]]]" = mp.Queue()
 
-	for i, block in enumerate(pmc_id_blocks):
-		in_q.put(block)
+	if verbose:
+		log(
+			main_proc, #type: ignore
+			f"Putting first {N_PROC} blocks in queue."
+		)
+
+	#for i, block in enumerate(pmc_id_blocks):
+	#	in_q.put(block)
+
+	for i in range(N_PROC):
+		in_q.put(pmc_id_blocks[i])
+
+	block_counter = N_PROC
 
 	sleep_locks: Dict[int, Lock] = {}
 
@@ -245,7 +348,7 @@ if __name__ == "__main__":
 	for i in range(N_PROC):
 		proc = mp.Process(
 			target = worker,
-			args = (in_q, out_q, sleep_locks)
+			args = (in_q, out_q, sleep_locks, verbose)
 		)
 		proc.start()
 		procs.append(proc)
@@ -257,13 +360,47 @@ if __name__ == "__main__":
 		while len(proc_results) < len(pmc_id_blocks):
 			new_result = out_q.get()
 
+			if verbose:
+				block_num = new_result[0]
+				log(
+					main_proc, #type: ignore
+					f"Retrieved {block_num} from result queue."
+				)
+
+			if block_counter < len(pmc_id_blocks):
+				next_queue_block = pmc_id_blocks[block_counter]
+				next_block_num = next_queue_block[0]
+
+				if verbose:
+					log(
+						main_proc, #type: ignore
+						f"Putting block {next_block_num} in queue."
+					)
+
+				in_q.put(next_queue_block)
+				block_counter += 1
+
+			else:
+				if verbose:
+					log(
+						main_proc, #type: ignore
+						f"No more blocks to add to queue."
+					)
+				pass
+
 			proc_results.append(new_result)
 			pbar.update(len(new_result[1]))
 
 	for i, proc in enumerate(procs):
-		print(f"Joining worker {i}")
+		log(
+			main_proc, #type: ignore
+			f"Joining worker {i}"
+		)
 		if proc.is_alive():
-			print(f"\tWorker {i} was sleeping, termination sent.")
+			log(
+				main_proc, #type: ignore
+				f"\tWorker {i} was sleeping, termination sent."
+			)
 			proc.terminate()
 		proc.join(timeout = 0.5)
 
